@@ -1,7 +1,8 @@
-# PE Ownership Checker (fixed for Streamlit Cloud)
+# PE Ownership Checker (Streamlit Cloud–friendly, hardened)
 import re, time, random
 from functools import lru_cache
 from typing import List, Dict, Optional, Tuple
+
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
@@ -10,71 +11,81 @@ WIKI_API = "https://en.wikipedia.org/w/api.php"
 WIKI_BASE = "https://en.wikipedia.org/wiki/"
 USER_AGENT = "PEOwnershipChecker/1.0 (https://streamlit.app; contact: example@example.com)"
 
-# ---- polite Wikipedia HTTP helper ----
-def _http_get(url, params=None, timeout=20, max_retries=3):
-    """HTTP GET with User-Agent and retry/backoff to avoid Wikipedia 403/429 errors."""
-    backoff = 0.7
+# ---------- HTTP helper with User-Agent + robust retry/backoff ----------
+def _http_get(url, params=None, timeout=20, max_retries=5):
+    """
+    Polite Wikipedia requests with a UA and exponential backoff.
+    Retries on 403/429/5xx and network exceptions.
+    """
+    backoff = 0.8
     last_exc = None
     for attempt in range(max_retries):
         try:
-            r = requests.get(url, params=params or {}, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+            r = requests.get(
+                url,
+                params=params or {},
+                headers={"User-Agent": USER_AGENT},
+                timeout=timeout,
+            )
             r.raise_for_status()
             return r
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
-            # retry transient errors
-            if status in (429, 500, 502, 503, 504):
+            # Retry on rate limits & transient failures (include 403 for hosted environments)
+            if status in (403, 429, 500, 502, 503, 504):
                 time.sleep(backoff)
-                backoff *= 1.6 + random.random() * 0.2
-                last_exc = e
-                continue
-            # retry once on 403
-            if attempt == 0 and status == 403:
-                time.sleep(0.8)
+                backoff *= 1.8
                 last_exc = e
                 continue
             raise
         except requests.RequestException as e:
+            # Network hiccup: retry
             time.sleep(backoff)
-            backoff *= 1.6 + random.random() * 0.2
+            backoff *= 1.8
             last_exc = e
             continue
     if last_exc:
         raise last_exc
 
-# ---- constants ----
+# ---------- PE heuristics ----------
 KNOWN_PE_FIRMS = {
-    "blackstone","kkr","carlyle","apollo global","tpg capital","advent international","hellman & friedman",
-    "warburg pincus","vista equity","silver lake","thoma bravo","platinium equity","eqt","permira",
-    "bain capital","gtcr","leonard green","genstar","audax","charterhouse","bc partners","clearlake capital",
-    "sycamore partners","sun capital","centerbridge","apax partners","new mountain capital","hellman and friedman"
+    "blackstone", "kkr", "carlyle", "apollo global", "tpg capital", "advent international",
+    "hellman & friedman", "warburg pincus", "vista equity", "silver lake", "thoma bravo",
+    "platinium equity", "eqt", "permira", "bain capital", "gtcr", "leonard green",
+    "genstar", "audax", "charterhouse", "bc partners", "clearlake capital", "sycamore partners",
+    "sun capital", "centerbridge", "apax partners", "new mountain capital", "hellman and friedman"
 }
 
 PE_KEYWORDS = [
-    r"private[-\s]?equity", r"leveraged buyout", r"LBO", r"buyout firm",
-    r"PE-backed", r"PE backed", r"taken private",
-    r"owner[s]?:?\s+[A-Z][A-Za-z&\s]+(Capital|Partners|Equity)"
+    r"private[-\s]?equity", r"leveraged buyout", r"LBO", r"buyout firm", r"PE-backed", r"PE backed",
+    r"taken private", r"owner[s]?:?\s+[A-Z][A-Za-z&\s]+(Capital|Partners|Equity)"
 ]
 
-# ---- Wikipedia API helpers ----
+# ---------- Wikipedia helpers ----------
 @lru_cache(maxsize=256)
 def wiki_search(query: str) -> Optional[str]:
-    """Find the best Wikipedia page title for a company name."""
-    params = {"action": "opensearch", "search": query, "limit": 1, "namespace": 0, "format": "json"}
+    """Find the best Wikipedia page title for a company name; never raises."""
+    # Try OpenSearch first
     try:
+        params = {"action": "opensearch", "search": query, "limit": 1, "namespace": 0, "format": "json"}
         r = _http_get(WIKI_API, params=params, timeout=15)
         data = r.json()
         if data and len(data) >= 2 and data[1]:
             return data[1][0]
     except Exception:
+        pass  # fall through
+
+    # Fallback: 'query' search API
+    try:
+        params2 = {"action": "query", "list": "search", "srsearch": query, "srlimit": 1, "format": "json"}
+        r2 = _http_get(WIKI_API, params=params2, timeout=20)
+        data2 = r2.json()
+        hits = data2.get("query", {}).get("search", [])
+        if hits:
+            return hits[0].get("title")
+    except Exception:
         pass
-    # fallback
-    params2 = {"action": "query", "list": "search", "srsearch": query, "srlimit": 1, "format": "json"}
-    r2 = _http_get(WIKI_API, params=params2, timeout=15)
-    data2 = r2.json()
-    hits = data2.get("query", {}).get("search", [])
-    if hits:
-        return hits[0].get("title")
+
     return None
 
 @lru_cache(maxsize=256)
@@ -93,7 +104,7 @@ def wiki_page_metadata(title: str) -> Dict:
     data = r.json()
     return data.get("parse", {})
 
-# ---- parsing helpers ----
+# ---------- Parsing helpers ----------
 def extract_infobox(soup: BeautifulSoup):
     for cls in ["infobox vcard", "infobox", "infobox vevent", "infobox hproduct"]:
         tag = soup.find("table", {"class": lambda c: c and cls in c})
@@ -117,7 +128,7 @@ def looks_like_company_page(soup: BeautifulSoup) -> bool:
     text = soup.get_text(" ", strip=True).lower()
     return any(k in text for k in ["industry", "founded", "headquarters", "revenue", "number of employees"])
 
-# ---- PE detection heuristics ----
+# ---------- PE detection ----------
 def is_pe_owned_from_infobox(info):
     fields = ["owner", "owners", "parent company", "parent", "owner(s)", "key people"]
     hay = " ".join([info.get(f, "") for f in fields]).lower()
@@ -153,19 +164,23 @@ def extract_body_text(html: str) -> str:
     content = soup.find("div", {"class": "mw-parser-output"})
     return re.sub(r"\s+", " ", content.get_text(" ", strip=True)) if content else soup.get_text(" ", strip=True)
 
-# ---- main logic ----
+# ---------- Main logic ----------
 @lru_cache(maxsize=512)
 def get_page_pe_status(title: str) -> Dict:
     html = wiki_page_html(title)
     soup = BeautifulSoup(html, "html.parser")
+
     info = get_infobox_text_map(extract_infobox(soup))
     body_text = extract_body_text(html)
+
     pe1, why1 = is_pe_owned_from_infobox(info)
     pe2, why2 = is_pe_owned_from_body(body_text)
     is_pe = pe1 or pe2
     reason = why1 or why2 or "No PE indicators."
+
     meta = wiki_page_metadata(title)
     cats, links = detect_industry_categories(meta)
+
     return {
         "title": title,
         "url": WIKI_BASE + title.replace(" ", "_"),
@@ -180,8 +195,11 @@ def category_members(category_name: str, max_items: int = 20) -> List[str]:
     out, cmcontinue, tries = [], None, 0
     while len(out) < max_items and tries < 5:
         params = {
-            "action": "query", "list": "categorymembers", "cmtitle": f"Category:{category_name}",
-            "cmlimit": min(50, max_items - len(out)), "format": "json"
+            "action": "query",
+            "list": "categorymembers",
+            "cmtitle": f"Category:{category_name}",
+            "cmlimit": min(50, max_items - len(out)),
+            "format": "json"
         }
         if cmcontinue:
             params["cmcontinue"] = cmcontinue
@@ -202,16 +220,31 @@ def find_candidate_peers(seed_title: str, categories: List[str], limit: int = 40
     top = categories[:2] if categories else []
     for cat in top:
         peers += category_members(cat, max_items=limit // 2)
+
+    # Try to leverage "List of ... companies" pages linked from the article
     try:
-        html = wiki_page_html(seed_title)
-        soup = BeautifulSoup(html, "html.parser")
+        seed_html = wiki_page_html(seed_title)
+        soup = BeautifulSoup(seed_html, "html.parser")
         for a in soup.select("a[href^='/wiki/']"):
             t = a.get("title") or ""
             if t.lower().startswith("list of") and "companies" in t.lower():
-                peers += category_members(t, limit // 2)
+                # Quick scrape of company links from that list page
+                try:
+                    html = wiki_page_html(t)
+                    soup_list = BeautifulSoup(html, "html.parser")
+                    for a2 in soup_list.select("div.mw-parser-output a[href^='/wiki/']"):
+                        tt = a2.get("title")
+                        if tt and ":" not in tt and not tt.startswith("List of"):
+                            peers.append(tt)
+                            if len(peers) >= limit:
+                                break
+                except Exception:
+                    pass
                 break
     except Exception:
         pass
+
+    # De-dup & remove seed
     dd, seen = [], set()
     for p in peers:
         if p and p != seed_title and p not in seen:
@@ -231,16 +264,16 @@ def filter_non_pe(peers: List[str], max_keep: int = 12) -> List[Dict]:
             if not looks_like_company_page(soup):
                 continue
             res.append({"title": s["title"], "url": s["url"]})
-            time.sleep(0.4)
+            time.sleep(0.4)  # be gentle to the API
             if len(res) >= max_keep:
                 break
         except Exception:
             continue
     return res
 
-# ---- Streamlit UI ----
+# ---------- Streamlit UI ----------
 st.set_page_config(page_title="PE Ownership Checker", page_icon="💼", layout="centered")
-st.title("💼 Private-Equity Ownership Checker (fixed)")
+st.title("💼 Private-Equity Ownership Checker")
 st.caption("Heuristic Wikipedia-based ownership lookup. Verify results manually.")
 
 query = st.text_input("Company name", placeholder="e.g., Staples, Panera Bread, Epicor")
@@ -251,16 +284,14 @@ with st.expander("Settings"):
     show_debug = st.checkbox("Show debug details")
 
 if go and query.strip():
-    try:
-        with st.spinner("Searching Wikipedia..."):
-            title = wiki_search(query.strip())
-    except Exception as e:
-        st.error(f"Wikipedia API error: {e}")
-        st.caption("Try again later — Wikipedia might be rate-limiting.")
-        st.stop()
+    with st.spinner("Searching Wikipedia..."):
+        title = wiki_search(query.strip())
+
     if not title:
-        st.error("No matching Wikipedia page found.")
+        st.error("Couldn’t reach Wikipedia or no results found. Please try again in a minute.")
+        st.caption("The app retries automatically, but Wikipedia may throttle hosted apps occasionally.")
         st.stop()
+
     try:
         status = get_page_pe_status(title)
         st.subheader(status["title"])
@@ -284,11 +315,13 @@ if go and query.strip():
         with st.spinner("Finding peers..."):
             peers = find_candidate_peers(status["title"], status["categories"])
             non_pe = filter_non_pe(peers, max_keep=max_peers)
+
         if not non_pe:
             st.info("No clear non-PE peers found.")
         else:
             for p in non_pe:
                 st.markdown(f"- [{p['title']}]({p['url']})")
+
     except Exception as e:
         st.error(f"Error: {e}")
         st.caption("Try again or check your connection.")
